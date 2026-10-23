@@ -30,7 +30,16 @@ import {
   getChampion,
   matchupKey,
   sameMatchup,
+  LANES,
+  LANE_LABEL,
+  laneChampions,
+  lanesOf,
+  estimate,
+  estimateAnyLane,
+  getDdragonVersion,
+  setDdragonVersion,
   type Champion,
+  type Lane,
   type Matchup,
   type MatchupStatus,
 } from "./matchupsData";
@@ -47,6 +56,7 @@ interface Saved {
   recents: { mine: string; enemy: string }[];
   pool: string[];
   custom: Record<string, Matchup>; // edições do usuário, por matchupKey
+  lane: Lane;
 }
 
 const loadSaved = (): Saved => {
@@ -56,6 +66,7 @@ const loadSaved = (): Saved => {
     recents: [],
     pool: DEFAULT_POOL,
     custom: {},
+    lane: "top",
   };
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -75,8 +86,6 @@ const loadSaved = (): Saved => {
   }
   return fallback;
 };
-
-const STATUS_ORDER: MatchupStatus[] = ["favoravel", "skill", "desfavoravel"];
 
 const downloadJson = (data: unknown, filename: string) => {
   const blob = new Blob([JSON.stringify(data, null, 2) + "\n"], {
@@ -104,7 +113,8 @@ const inputCls =
 // ---------------------------------------------------------------------------
 function ChampIcon({ champ, size = 64 }: { champ?: Champion; size?: number }) {
   const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [champ?.id]);
+  const version = getDdragonVersion();
+  useEffect(() => setFailed(false), [champ?.id, version]);
 
   if (!champ || failed) {
     return (
@@ -122,6 +132,7 @@ function ChampIcon({ champ, size = 64 }: { champ?: Champion; size?: number }) {
       alt={champ.name}
       width={size}
       height={size}
+      loading="lazy"
       onError={() => setFailed(true)}
       className="rounded-xl border border-amber-500/40 object-cover"
       style={{ width: size, height: size }}
@@ -275,12 +286,16 @@ function ChampionPicker({
   title,
   pool,
   showPool,
+  priorityIds,
+  priorityTitle,
   onPick,
   onClose,
 }: {
   title: string;
   pool: string[];
   showPool: boolean;
+  priorityIds?: Set<string>;
+  priorityTitle?: string;
   onPick: (id: string) => void;
   onClose: () => void;
 }) {
@@ -292,25 +307,35 @@ function ChampionPicker({
     return CHAMPIONS.filter((c) => c.name.toLowerCase().includes(q));
   }, [query]);
 
-  const inPool = showPool ? filtered.filter((c) => poolSet.has(c.id)) : [];
-  const rest = showPool ? filtered.filter((c) => !poolSet.has(c.id)) : filtered;
+  // Primeira seção: pool (meu campeão) ou campeões da lane (inimigo).
+  let first: Champion[] = [];
+  let firstTitle = "";
+  if (showPool) {
+    first = filtered.filter((c) => poolSet.has(c.id));
+    firstTitle = "Minha pool";
+  } else if (priorityIds) {
+    first = filtered.filter((c) => priorityIds.has(c.id));
+    firstTitle = priorityTitle ? `Da lane ${priorityTitle}` : "Da lane";
+  }
+  const firstIds = new Set(first.map((c) => c.id));
+  const rest = filtered.filter((c) => !firstIds.has(c.id));
 
   return (
     <Modal title={title} onClose={onClose}>
       <SearchBox value={query} onChange={setQuery} />
       <div className="space-y-4 overflow-y-auto px-4 pb-6">
-        {inPool.length > 0 && (
+        {first.length > 0 && (
           <div>
             <p className="mb-2 flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-amber-300">
-              <Star size={12} /> Minha pool
+              <Star size={12} /> {firstTitle}
             </p>
-            <ChampGrid list={inPool} onPick={onPick} />
+            <ChampGrid list={first} onPick={onPick} />
           </div>
         )}
         {rest.length > 0 && (
           <div>
             <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">
-              {showPool ? "Outros campeões" : "Todos os campeões"}
+              {first.length > 0 ? "Outros campeões" : "Todos os campeões"}
             </p>
             <ChampGrid list={rest} onPick={onPick} />
           </div>
@@ -397,6 +422,7 @@ function MatchupEditor({
   mineId,
   enemyId,
   initial,
+  defaultStatus,
   canRestore,
   onSave,
   onRestore,
@@ -405,12 +431,13 @@ function MatchupEditor({
   mineId: string;
   enemyId: string;
   initial?: Matchup;
+  defaultStatus?: MatchupStatus;
   canRestore: boolean;
   onSave: (m: Matchup) => void;
   onRestore: () => void;
   onClose: () => void;
 }) {
-  const [status, setStatus] = useState<MatchupStatus>(initial?.status ?? "skill");
+  const [status, setStatus] = useState<MatchupStatus>(initial?.status ?? defaultStatus ?? "skill");
   const [goldenRule, setGoldenRule] = useState(initial?.goldenRule ?? "");
   const [early, setEarly] = useState(initial?.laning.early ?? "");
   const [mid, setMid] = useState(initial?.laning.mid ?? "");
@@ -505,9 +532,18 @@ function MatchupEditor({
 // ---------------------------------------------------------------------------
 // Counter Finder
 // ---------------------------------------------------------------------------
+interface Candidate {
+  champion: string;
+  status: MatchupStatus;
+  estimate: boolean; // true = só dificuldade estimada, sem guia
+  summary: string;
+}
+
 function CounterFinder({
   enemy,
   enemyChamp,
+  lane,
+  onLane,
   pool,
   custom,
   onPickEnemy,
@@ -515,6 +551,8 @@ function CounterFinder({
 }: {
   enemy: string | null;
   enemyChamp?: Champion;
+  lane: Lane;
+  onLane: (l: Lane) => void;
   pool: string[];
   custom: Record<string, Matchup>;
   onPickEnemy: () => void;
@@ -522,17 +560,38 @@ function CounterFinder({
 }) {
   const [onlyPool, setOnlyPool] = useState(true);
 
-  // Todas as matchups contra o inimigo escolhido (base + edições do usuário)
-  const candidates = useMemo(() => {
+  // Todos os campeões da lane contra o inimigo: guia (base ou editado) quando
+  // existe, senão a dificuldade estimada.
+  const candidates = useMemo<Candidate[]>(() => {
     if (!enemy) return [];
-    const map = new Map<string, Matchup>();
-    for (const m of MATCHUPS) if (m.enemy === enemy) map.set(m.champion, m);
-    for (const m of Object.values(custom)) if (m.enemy === enemy) map.set(m.champion, m);
     const poolSet = new Set(pool);
-    return Array.from(map.values()).filter(
-      (m) => !onlyPool || poolSet.has(m.champion)
+    const out: Candidate[] = [];
+    for (const id of laneChampions[lane]) {
+      if (id === enemy) continue;
+      if (onlyPool && !poolSet.has(id)) continue;
+      const guide = custom[matchupKey(id, enemy)] ?? baseMatchup(id, enemy);
+      if (guide) {
+        out.push({
+          champion: id,
+          status: guide.status,
+          estimate: false,
+          summary: guide.summary,
+        });
+        continue;
+      }
+      const est = estimate(id, enemy, lane);
+      if (est) out.push({ champion: id, status: est, estimate: true, summary: "" });
+    }
+    const name = (id: string) => getChampion(id)?.name ?? id;
+    return out.sort(
+      (a, b) =>
+        Number(a.estimate) - Number(b.estimate) ||
+        name(a.champion).localeCompare(name(b.champion))
     );
-  }, [enemy, custom, pool, onlyPool]);
+  }, [enemy, lane, custom, pool, onlyPool]);
+
+  const enemyLanes = enemy ? lanesOf(enemy) : [];
+  const enemyOutsideLane = !!enemy && !enemyLanes.includes(lane);
 
   const groups: { status: MatchupStatus; title: string; hint: string }[] = [
     { status: "favoravel", title: "Counters", hint: "Matchups favoráveis" },
@@ -546,6 +605,23 @@ function CounterFinder({
         <p className="mb-3 text-center text-sm text-slate-300">
           Putz, quem “countera” esse boneco?
         </p>
+
+        <div className="mb-4 flex flex-wrap justify-center gap-1.5">
+          {LANES.map((l) => (
+            <button
+              key={l}
+              onClick={() => onLane(l)}
+              className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                lane === l
+                  ? "border-amber-400 bg-amber-400 text-slate-900"
+                  : "border-slate-700 text-slate-400 hover:border-amber-400/60 hover:text-slate-200"
+              }`}
+            >
+              {LANE_LABEL[l]}
+            </button>
+          ))}
+        </div>
+
         <button
           onClick={onPickEnemy}
           className="mx-auto flex items-center gap-3 rounded-2xl border border-slate-700 bg-slate-950/60 px-4 py-3 transition hover:border-rose-400/70"
@@ -572,6 +648,26 @@ function CounterFinder({
         </label>
       </div>
 
+      {enemyOutsideLane && (
+        <div className="rounded-2xl border border-amber-400/30 bg-amber-400/10 p-3 text-center text-xs text-amber-100">
+          {enemyChamp?.name} não está na lista de {LANE_LABEL[lane]}.
+          {enemyLanes.length > 0 && (
+            <>
+              {" "}Ele aparece em:{" "}
+              {enemyLanes.map((l) => (
+                <button
+                  key={l}
+                  onClick={() => onLane(l)}
+                  className="mx-0.5 rounded-full border border-amber-400/50 px-2 py-0.5 font-semibold hover:bg-amber-400/20"
+                >
+                  {LANE_LABEL[l]}
+                </button>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+
       {!enemy ? (
         <div className="rounded-2xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-400">
           <Crosshair className="mx-auto mb-2 text-slate-600" />
@@ -580,9 +676,9 @@ function CounterFinder({
       ) : candidates.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-400">
           <Crosshair className="mx-auto mb-2 text-slate-600" />
-          Nenhuma matchup cadastrada contra{" "}
+          Nenhum campeão de {LANE_LABEL[lane]} para comparar contra{" "}
           <b className="text-slate-200">{enemyChamp?.name}</b>
-          {onlyPool ? " na sua pool. Desmarque o filtro para ver todas." : "."}
+          {onlyPool ? " na sua pool. Desmarque o filtro para ver todos." : "."}
         </div>
       ) : (
         groups.map((g) => {
@@ -596,7 +692,9 @@ function CounterFinder({
                 >
                   {g.title}
                 </span>
-                <span className="text-xs text-slate-500">{g.hint}</span>
+                <span className="text-xs text-slate-500">
+                  {g.hint} · {list.length}
+                </span>
               </h3>
               <ul className="space-y-2">
                 {list.map((m) => (
@@ -607,11 +705,20 @@ function CounterFinder({
                     >
                       <ChampIcon champ={getChampion(m.champion)} size={48} />
                       <span className="min-w-0 flex-1">
-                        <span className="block text-sm font-semibold text-slate-100">
-                          {getChampion(m.champion)?.name}
+                        <span className="flex items-center gap-2">
+                          <span className="text-sm font-semibold text-slate-100">
+                            {getChampion(m.champion)?.name}
+                          </span>
+                          {m.estimate && (
+                            <span className="rounded-full border border-slate-600 bg-slate-800 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-slate-300">
+                              Estimativa
+                            </span>
+                          )}
                         </span>
                         <span className="line-clamp-2 text-xs text-slate-400">
-                          {m.summary}
+                          {m.estimate
+                            ? "Dificuldade estimada, ainda sem guia."
+                            : m.summary}
                         </span>
                       </span>
                     </button>
@@ -624,8 +731,8 @@ function CounterFinder({
       )}
 
       <p className="px-2 text-center text-[11px] text-slate-500">
-        Só aparecem campeões que têm matchup cadastrada contra o inimigo.
-        Adicione análises pelo botão de edição para ampliar a lista.
+        “Estimativa” é uma classificação de dificuldade feita em lote, sem guia
+        escrito. Toque no campeão e use o editor para criar sua análise.
       </p>
     </div>
   );
@@ -714,6 +821,23 @@ export default function App() {
   const [editingMatchup, setEditingMatchup] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [tab, setTab] = useState<Tab>("matchup");
+  const [lane, setLane] = useState<Lane>(saved.lane);
+  const [, bumpIcons] = useState(0);
+
+  // Atualiza a versão do Data Dragon para os ícones (inclui campeões novos).
+  useEffect(() => {
+    fetch("https://ddragon.leagueoflegends.com/api/versions.json")
+      .then((r) => r.json())
+      .then((v: string[]) => {
+        if (v[0] && v[0] !== getDdragonVersion()) {
+          setDdragonVersion(v[0]);
+          bumpIcons((n) => n + 1);
+        }
+      })
+      .catch(() => {
+        /* offline: segue com a versão embutida */
+      });
+  }, []);
 
   const mineChamp = mine ? getChampion(mine) : undefined;
   const enemyChamp = enemy ? getChampion(enemy) : undefined;
@@ -722,18 +846,20 @@ export default function App() {
   const base = mine && enemy ? baseMatchup(mine, enemy) : undefined;
   const edited = key ? custom[key] : undefined;
   const matchup = edited ?? base;
+  const est =
+    mine && enemy && !matchup ? estimateAnyLane(mine, enemy) : undefined;
 
   // Persistência
   useEffect(() => {
     try {
       localStorage.setItem(
         STORAGE_KEY,
-        JSON.stringify({ mine, enemy, recents, pool, custom } satisfies Saved)
+        JSON.stringify({ mine, enemy, recents, pool, custom, lane } satisfies Saved)
       );
     } catch {
       /* ignore */
     }
-  }, [mine, enemy, recents, pool, custom]);
+  }, [mine, enemy, recents, pool, custom, lane]);
 
   // Histórico de matchups consultadas
   useEffect(() => {
@@ -748,7 +874,11 @@ export default function App() {
 
   const handlePick = (id: string) => {
     if (picking === "mine") setMine(id);
-    if (picking === "enemy") setEnemy(id);
+    if (picking === "enemy") {
+      setEnemy(id);
+      const ls = lanesOf(id);
+      if (ls.length > 0 && !ls.includes(lane)) setLane(ls[0]);
+    }
     setPicking(null);
   };
 
@@ -782,7 +912,7 @@ export default function App() {
             LoL Matchup Encyclopedia
           </h1>
           <p className="mt-1 text-xs text-slate-400">
-            Guia rápido de matchups para o Top Lane
+            Guia rápido de matchups e counters para todas as lanes
           </p>
           <div className="absolute right-0 top-5 flex gap-2">
             <button
@@ -834,6 +964,8 @@ export default function App() {
           <CounterFinder
             enemy={enemy}
             enemyChamp={enemyChamp}
+            lane={lane}
+            onLane={setLane}
             pool={pool}
             custom={custom}
             onPickEnemy={() => setPicking("enemy")}
@@ -900,6 +1032,32 @@ export default function App() {
             <div className="rounded-2xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-400">
               <Swords className="mx-auto mb-2 text-slate-600" />
               Selecione seu campeão e o inimigo para ver o guia.
+            </div>
+          ) : !matchup && est ? (
+            <div className="rounded-2xl border border-dashed border-slate-700 p-6 text-center text-sm text-slate-400">
+              <div className="mb-3 flex flex-wrap items-center justify-center gap-2">
+                <span
+                  className={`rounded-full border px-4 py-1 text-xs font-bold uppercase tracking-widest ${STATUS_STYLE[est.status]}`}
+                >
+                  {STATUS_LABEL[est.status]}
+                </span>
+                <span className="rounded-full border border-slate-600 bg-slate-800 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">
+                  Estimativa · {LANE_LABEL[est.lane]}
+                </span>
+              </div>
+              Ainda não há guia para{" "}
+              <b className="text-slate-200">
+                {mineChamp?.name} vs {enemyChamp?.name}
+              </b>
+              . Esta é só a dificuldade estimada da matchup.
+              <div className="mt-4">
+                <button
+                  onClick={() => setEditingMatchup(true)}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-amber-400 px-4 py-2 text-sm font-bold text-slate-900"
+                >
+                  <Plus size={16} /> Criar análise
+                </button>
+              </div>
             </div>
           ) : !matchup ? (
             <div className="rounded-2xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-400">
@@ -1021,6 +1179,8 @@ export default function App() {
           title={picking === "mine" ? "Escolha seu campeão" : "Escolha o inimigo"}
           pool={pool}
           showPool={picking === "mine"}
+          priorityIds={picking === "enemy" ? laneChampions[lane] : undefined}
+          priorityTitle={LANE_LABEL[lane]}
           onPick={handlePick}
           onClose={() => setPicking(null)}
         />
@@ -1039,6 +1199,7 @@ export default function App() {
           mineId={mine}
           enemyId={enemy}
           initial={matchup}
+          defaultStatus={est?.status}
           canRestore={!!edited}
           onSave={saveMatchup}
           onRestore={restoreMatchup}

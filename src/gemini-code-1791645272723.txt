@@ -1,0 +1,16 @@
+lol-matchup-encyclopedia/
+├── public/
+├── src/
+│   ├── data/
+│   │   └── matchupsData.ts       # Mapeamento do seu conhecimento técnico (Playbooks)
+│   ├── types/
+│   │   └── lol.ts                # Definições de Tipos em TypeScript
+│   ├── components/
+│   │   ├── Header.tsx            # Cabeçalho Gamer/Hextech
+│   │   ├── ChampionSelector.tsx  # Grid/Tabela de Seleção com Busca e Favoritos
+│   │   ├── CounterFinder.tsx     # Aba: Escolha o Inimigo -> Veja os Counters
+│   │   └── MatchupView.tsx       # Exibição do Playbook Completo da Rota
+│   ├── App.tsx                   # Componente Principal com Integração à Riot API
+│   └── index.css                 # Configurações do Tailwind
+├── package.json
+└── README.md
